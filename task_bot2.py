@@ -1,13 +1,14 @@
 import os
+import discord
 import asyncio
 from datetime import datetime
-import discord
 from discord.ext import commands
 import google.generativeai as genai
 from dotenv import load_dotenv
-from fastapi import FastAPI
-import uvicorn
-from contextlib import asynccontextmanager
+from aiohttp import web
+import aiohttp
+import threading
+import json
 
 load_dotenv()
 
@@ -161,6 +162,93 @@ When this server's AI bot responds to questions, it should:
 """
 
 # -----------------------
+# Web Server for Health Checks
+# -----------------------
+class WebServer:
+    def __init__(self):
+        self.app = web.Application()
+        self.setup_routes()
+        self.start_time = datetime.now()
+        
+    def setup_routes(self):
+        self.app.router.add_get('/', self.index)
+        self.app.router.add_get('/health', self.health_check)
+        self.app.router.add_head('/health', self.health_check_head)
+        self.app.router.add_get('/favicon.ico', self.favicon)
+        self.app.router.add_head('/favicon.ico', self.favicon_head)
+        self.app.router.add_get('/status', self.status)
+        
+    async def index(self, request):
+        return web.json_response({
+            'status': 'online',
+            'service': 'Discord Bot - Reddit Tasks Helper',
+            'uptime': str(datetime.now() - self.start_time).split('.')[0],
+            'timestamp': datetime.now().isoformat()
+        })
+    
+    async def health_check(self, request):
+        """Health check endpoint for uptime monitoring"""
+        try:
+            # Check if bot is connected
+            bot_status = bot.is_ready() if bot else False
+            
+            health_data = {
+                'status': 'healthy' if bot_status else 'degraded',
+                'bot_ready': bot_status,
+                'uptime': str(datetime.now() - self.start_time).split('.')[0],
+                'timestamp': datetime.now().isoformat(),
+                'servers': len(bot.guilds) if bot and bot.is_ready() else 0,
+                'latency': round(bot.latency * 1000) if bot and bot.is_ready() else None
+            }
+            
+            status_code = 200 if bot_status else 503
+            return web.json_response(health_data, status=status_code)
+            
+        except Exception as e:
+            return web.json_response({
+                'status': 'error',
+                'error': str(e),
+                'timestamp': datetime.now().isoformat()
+            }, status=500)
+    
+    async def health_check_head(self, request):
+        """Handle HEAD requests for health check"""
+        try:
+            bot_status = bot.is_ready() if bot else False
+            status_code = 200 if bot_status else 503
+            return web.Response(status=status_code)
+        except Exception:
+            return web.Response(status=500)
+    
+    async def favicon(self, request):
+        """Handle favicon requests"""
+        return web.Response(status=204)  # No Content
+    
+    async def favicon_head(self, request):
+        """Handle HEAD requests for favicon"""
+        return web.Response(status=204)  # No Content
+    
+    async def status(self, request):
+        """Detailed status endpoint"""
+        try:
+            return web.json_response({
+                'service': 'Discord Bot - Reddit Tasks Helper',
+                'status': 'online',
+                'bot_ready': bot.is_ready() if bot else False,
+                'uptime': str(datetime.now() - self.start_time).split('.')[0],
+                'servers': len(bot.guilds) if bot and bot.is_ready() else 0,
+                'latency': f"{round(bot.latency * 1000)}ms" if bot and bot.is_ready() else None,
+                'timestamp': datetime.now().isoformat(),
+                'version': '1.0.0'
+            })
+        except Exception as e:
+            return web.json_response({
+                'status': 'error',
+                'error': str(e),
+                'timestamp': datetime.now().isoformat()
+            }, status=500)
+
+# -----------------------
 # Bot Cog
 # -----------------------
 class DiscordBot(commands.Cog):
@@ -226,7 +314,7 @@ RESPONSE GUIDELINES:
 - Answer ONLY what's explicitly stated in the server rules above
 - Use simple, beginner-friendly language
 - Give step-by-step instructions when the rules provide them
-- If the question asks about something not in the rules, respond with: "I don't have that information in our server rules. Please ask in <#1379815484056277044> or DM <@703280080213901342 for help."
+- If the question asks about something not in the rules, respond with: "I don't have that information in our server rules. Please ask in <#1379815484056277044> or DM <@703280080213901342> for help."
 - For rule violations, explain what the rule says and why it exists
 - Keep responses under 300 words
 - Never mention payment amounts, dates, or procedures unless they're exactly as written in the rules
@@ -255,12 +343,13 @@ If the question is completely unrelated to server rules or operations, respond: 
             # Fallback to backup
             try:
                 backup_key = os.getenv('GEMINI_BACKUP_API_KEY')
-                if not backup_key:
-                    raise RuntimeError("No backup API key configured")
-                genai.configure(api_key=backup_key)
-                backup_resp = backup_model.generate_content(prompt)
-                answer = backup_resp.text.strip() or \
-                         "I couldn't generate a proper response. Please ask in <#1379815484056277044> or DM <@703280080213901342> for help."
+                if backup_key:
+                    genai.configure(api_key=backup_key)
+                    backup_resp = backup_model.generate_content(prompt)
+                    answer = backup_resp.text.strip() or \
+                             "I couldn't generate a proper response. Please ask in <#1379815484056277044> or DM <@703280080213901342> for help."
+                else:
+                    answer = "I'm having trouble with my AI service. Please ask in <#1379815484056277044> or DM <@703280080213901342> for help."
             except Exception as backup_error:
                 print(f"Backup API failed: {backup_error}")
                 answer = "❌ I'm having trouble connecting to my AI service right now. Please ask in <#1379815484056277044> or DM <@703280080213901342> for help!"
@@ -279,12 +368,18 @@ If the question is completely unrelated to server rules or operations, respond: 
     async def ask_question_error(self, interaction: discord.Interaction, error: discord.app_commands.AppCommandError):
         """Handle errors for the ask_question command"""
         if isinstance(error, discord.app_commands.MissingPermissions):
-            await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+            if interaction.response.is_done():
+                await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
+            else:
+                await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
         else:
-            await interaction.response.send_message("❌ An error occurred while processing your command.", ephemeral=True)
+            if interaction.response.is_done():
+                await interaction.followup.send("❌ An error occurred while processing your command.", ephemeral=True)
+            else:
+                await interaction.response.send_message("❌ An error occurred while processing your command.", ephemeral=True)
 
 # -----------------------
-# Bot event handlers
+# Bot event handlers & startup
 # -----------------------
 @bot.event
 async def on_ready():
@@ -304,77 +399,67 @@ async def on_guild_join(guild):
 async def on_guild_remove(guild):
     print(f'Left server: {guild.name} (ID: {guild.id})')
 
+@bot.event
+async def on_error(event, *args, **kwargs):
+    print(f'An error occurred in {event}: {args}, {kwargs}')
+
 # -----------------------
-# FastAPI with lifespan management
+# Main function
 # -----------------------
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup
-    print("🚀 Starting Discord bot...")
-    await bot.add_cog(DiscordBot(bot))
-    
-    discord_token = os.getenv('DISCORD_TOKEN')
-    if not discord_token:
-        print("❌ DISCORD_TOKEN environment variable not set")
-        raise RuntimeError("DISCORD_TOKEN environment variable is required")
-    
-    # Start bot in background task
-    bot_task = asyncio.create_task(bot.start(discord_token))
-    print("✅ Discord bot started successfully")
-    
+async def run_web_server():
+    """Run the web server for health checks"""
     try:
-        yield
-    finally:
-        # Shutdown
-        print("🔄 Shutting down Discord bot...")
-        await bot.close()
-        bot_task.cancel()
-        try:
-            await bot_task
-        except asyncio.CancelledError:
-            pass
-        print("✅ Discord bot shutdown complete")
+        web_server = WebServer()
+        port = int(os.getenv('PORT', 10000))
+        
+        print(f"Starting web server on port {port}")
+        runner = web.AppRunner(web_server.app)
+        await runner.setup()
+        
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+        print(f"Web server started on http://0.0.0.0:{port}")
+        
+        # Keep the server running
+        while True:
+            await asyncio.sleep(1)
+            
+    except Exception as e:
+        print(f"Error starting web server: {e}")
 
-app = FastAPI(
-    title="Discord Bot Health Check",
-    description="Health check endpoint for Discord bot deployment",
-    version="1.0.0",
-    lifespan=lifespan
-)
+async def run_discord_bot():
+    """Run the Discord bot"""
+    try:
+        await bot.add_cog(DiscordBot(bot))
+        
+        discord_token = os.getenv('DISCORD_TOKEN')
+        if not discord_token:
+            print("Error: DISCORD_TOKEN environment variable not set")
+            return
+            
+        await bot.start(discord_token)
+        
+    except Exception as e:
+        print(f"Error starting Discord bot: {e}")
 
-@app.get("/")
-async def health_check():
-    """Main health check endpoint"""
-    return {
-        "status": "Bot is running",
-        "timestamp": datetime.utcnow().isoformat(),
-        "bot_ready": bot.is_ready(),
-        "bot_latency": round(bot.latency * 1000) if bot.is_ready() else None,
-        "guilds": len(bot.guilds) if bot.is_ready() else 0
-    }
+async def main():
+    """Main function to run both web server and Discord bot"""
+    try:
+        # Run both the web server and Discord bot concurrently
+        await asyncio.gather(
+            run_web_server(),
+            run_discord_bot(),
+            return_exceptions=True
+        )
+    except KeyboardInterrupt:
+        print("Shutting down...")
+    except Exception as e:
+        print(f"Error in main: {e}")
 
-@app.get("/health")
-async def health():
-    """Simple health endpoint for monitoring"""
-    return {"status": "healthy"}
-
-@app.get("/stats")
-async def stats():
-    """Bot statistics endpoint"""
-    if not bot.is_ready():
-        return {"error": "Bot not ready"}
-    
-    return {
-        "guilds": len(bot.guilds),
-        "users": sum(guild.member_count for guild in bot.guilds),
-        "latency": round(bot.latency * 1000),
-        "uptime": str(datetime.now() - bot.start_time if hasattr(bot, 'start_time') else "Unknown")
-    }
-
-# -----------------------
-# Main entry point
-# -----------------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    print(f"🌐 Starting FastAPI server on port {port}")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Bot stopped by user")
+    except Exception as e:
+        print(f"Fatal error: {e}")
