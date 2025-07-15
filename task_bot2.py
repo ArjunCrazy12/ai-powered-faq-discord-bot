@@ -204,7 +204,7 @@ Rules:
 | Item          | Details                     |
 |---------------|-----------------------------|
 | Methods   | UPI (India), USDT (BEP20 only) |
-| Min Amount| UPI: none, Crypto: $2       |
+| Min Amount| No min amount for UPI & Crypto |
 | Payout Day| Every Monday (IST)      |
 | Submit Records | DM <@703280080213901342> on Saturday/Sunday |
 | Proof     | Post screenshot in `#💵payments` |
